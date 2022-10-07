@@ -33,14 +33,11 @@ class Solver(object):
 
     @staticmethod
     def _get_model_optimizer(opt):
-        kwargs = {} if opt.clipnorm is None else {"clipnorm": opt.clipnorm}
         if opt.optimizer == "adam":
             optimizer_params = {"beta_1": opt.beta_1, "beta_2": opt.beta_2, "epsilon": opt.epsilon}
-            optimizer_params.update(kwargs)
             optimizer = optimizers.Adam(opt.lr, **optimizer_params)
         elif opt.optimizer == "momentum":
             optimizer_params = {"momentum": opt.momentum, "nesterov": opt.nesterov}
-            optimizer_params.update(kwargs)
             optimizer = optimizers.SGD(opt.lr, **optimizer_params)
         else:
             raise ValueError(f"`optimizer` supports [adam/momentum], got {opt.optimizer}")

@@ -110,7 +110,7 @@ def compute_robust_moments(binary_image, isotropic=False, indexing="ij", min_std
     Parameters
     ----------
     binary_image: ndarray
-        Input a image
+        Input an image
     isotropic: boolean
         Compute isotropic standard deviation or not.
     indexing: {'xy', 'ij'}, optional

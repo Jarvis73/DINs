@@ -1,6 +1,11 @@
+from collections import defaultdict
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras.metrics import Mean
 from tensorflow.python.keras.metrics import MeanMetricWrapper
+from medpy import metric as mtr     # pip install medpy
+
+from utils.surface import Surface
 
 
 def get_metric_fns():
@@ -167,7 +172,6 @@ def metric_np_rvd(label, prediction, eps=1e-7):
     return np.sum(np.abs(label - prediction)) / (np.sum(label) + np.sum(prediction))
 
 
-@loss_metric_ingredient.capture
 def metric_3d(logits3d, labels3d, metrics_eval=None, **kwargs):
     """
     Compute 3D metrics:
@@ -258,7 +262,6 @@ def metric_3d(logits3d, labels3d, metrics_eval=None, **kwargs):
     sampling = kwargs.get("sampling", [1., 1., 1.])
 
     if need_dist_map:
-        from utils.surface import Surface
         if np.count_nonzero(logits3d) == 0 or np.count_nonzero(labels3d) == 0:
             metrics_3d['ASSD'] = 0
             metrics_3d['MSD'] = 0

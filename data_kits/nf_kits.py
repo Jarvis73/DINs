@@ -24,7 +24,7 @@ import pandas as pd
 import scipy.ndimage as ndi
 import tqdm
 
-ROOT = Path(__file__).parent.parent.parent
+ROOT = Path(__file__).parents[1]
 DATA_ROOT = ROOT / "data/NF"
 
 
@@ -76,14 +76,14 @@ def load_data(logger):
     data_dir = DATA_ROOT / "nii_NF"
     path_list = list(data_dir.glob("volume*"))
 
-    logger.info(f"Loading data ({len(path_list)} examples) ...")
+    logger.info(' ' * 11 + f"==> Loading data ({len(path_list)} examples) ...")
     cache_path = DATA_ROOT / "cache.pkl.gz"
     if cache_path.exists():
-        logger.info(f"Loading data cache from {cache_path}")
+        logger.info(' ' * 11 + f"==> Loading data cache from {cache_path}")
         with cache_path.open("rb") as f:
             data = zlib.decompress(f.read())
             _data_cache = pickle.loads(data)
-        logger.info("Finished!")
+        logger.info(' ' * 11 + "==> Finished!")
         return _data_cache
 
     _data_cache = {}
@@ -101,56 +101,15 @@ def load_data(logger):
                                  "meta": header,
                                  "lab_rng": np.unique(label)}
     with cache_path.open("wb") as f:
-        logger.info(f"Saving data cache to {cache_path}")
+        logger.info(' ' * 11 + f"==> Saving data cache to {cache_path}")
         cache_s = pickle.dumps(_data_cache, pickle.HIGHEST_PROTOCOL)
         f.write(zlib.compress(cache_s))
-    logger.info("Finished!")
+    logger.info(' ' * 11 + "==> Finished!")
     return _data_cache
 
 
-def pre_filter_data(data, filter_thresh, connectivity=3, down_sampling=False):
-    """ For object-based segmentation tasks.
-    Pre-compute connected components and remove small objects
-    """
-    _pre_filter_cache = None
-
-    cache_path = DATA_ROOT / ("pre-filter.pkl.gz" if not down_sampling else "pre-filter_ds.pkl.gz")
-    if cache_path.exists():
-        logger.info(f"Loading pre-filter cache from {cache_path}")
-        with cache_path.open("rb") as f:
-            data = zlib.decompress(f.read())
-            _pre_filter_cache = pickle.loads(data)
-        logger.info("Finished!")
-        return _pre_filter_cache
-
-    _pre_filter_cache = {}
-    for pid in data:
-        mask = data[pid]["lab"]
-        struct = ndi.generate_binary_structure(3, connectivity)
-        labeled, n_obj = ndi.label(mask, struct)
-        slices = ndi.find_objects(labeled)
-        obj_list = []
-        for i, sli in enumerate(slices):
-            patch = labeled[sli]
-            z, y, x = np.where(patch == i + 1)
-            if z.shape[0] < filter_thresh:
-                patch[z, y, x] = 0
-            else:
-                obj_list.append(np.stack((z, y, x), axis=1))
-        better_label = np.clip(labeled, 0, 1)
-        _pre_filter_cache[pid] = {"lab": better_label,
-                                  "obj_list": obj_list}
-    with cache_path.open("wb") as f:
-        logger.info(f"Saving pre-filter cache to {cache_path}")
-        cache_s = pickle.dumps(_pre_filter_cache, pickle.HIGHEST_PROTOCOL)
-        f.write(zlib.compress(cache_s))
-    logger.info("Finished!")
-    return _pre_filter_cache
-
-
-def load_split(set_key, test_fold):
-    if set_key in ["train", "val", "eval"]:
-        fold_path = DATA_ROOT / "split.csv"
+def load_split(set_key, test_fold, fold_path):
+    if set_key in ["train", "eval_online", "eval"]:
         folds = pd.read_csv(str(fold_path)).fillna(0).astype(int)
         val_split = folds.loc[folds.split == test_fold]
         if set_key != "train":
@@ -160,17 +119,11 @@ def load_split(set_key, test_fold):
         train_split = folds.loc[folds.split.isin(train_folds)]
         return train_split
     elif set_key == "test":
-        fold_path = DATA_ROOT / "split_test.csv"
-        folds = pd.read_csv(str(fold_path)).fillna(0).astype(int)
-        test_split = folds.loc[folds.split == 0]
-        return test_split
-    elif set_key == "extra":    # The dataset with 45 cases of 15 patients
-        fold_path = DATA_ROOT / "split_extra.csv"
         folds = pd.read_csv(str(fold_path)).fillna(0).astype(int)
         test_split = folds.loc[folds.split == 0]
         return test_split
     else:
-        raise ValueError(f"`set_key` supports [train|val|test|extra], got {set_key}")
+        raise ValueError(f"`set_key` supports [train|eval_online|eval|test|extra], got {set_key}")
 
 
 def filter_tiny_nf(mask):
@@ -192,21 +145,21 @@ def filter_tiny_nf(mask):
 def slim_labels(data, logger):
     slim_labels_path = DATA_ROOT / "slim_labels.pkl.gz"
     if slim_labels_path.exists():
-        logger.info(f"Loading slimmed label cache from {slim_labels_path}")
+        logger.info(' ' * 11 + f"==> Loading slimmed label cache from {slim_labels_path}")
         with slim_labels_path.open("rb") as f:
             new_labels = pickle.loads(zlib.decompress(f.read()))
         for i in data:
             data[i]['slim'] = new_labels[i]
-        logger.info("Finished!")
+        logger.info(' ' * 11 + "==> Finished!")
     else:
         new_labels = {}
-        logger.info(f"Saving slimmed label cache to {slim_labels_path}")
+        logger.info(' ' * 11 + f"==> Saving slimmed label cache to {slim_labels_path}")
         for i, item in data.items():
             new_labels[i] = filter_tiny_nf(np.clip(item['lab'], 0, 1).copy())
             data[i]['slim'] = new_labels[i]
         with slim_labels_path.open("wb") as f:
             f.write(zlib.compress(pickle.dumps(new_labels, pickle.HIGHEST_PROTOCOL)))
-        logger.info("Finished!")
+        logger.info(' ' * 11 + "==> Finished!")
 
     return data
 
@@ -219,68 +172,3 @@ def load_test_data_paths():
         pid = int(path.name.split("-")[0])
         dataset[pid] = {"img_path": path, "lab_path": path.parent / path.name.replace("img", "mask")}
     return dataset
-
-
-extra_name_mapping = {
-    "---Abdomen1__20080620-img.nii.gz": 0,
-    "---Abdomen1__20101129-img.nii.gz": 1,
-    "---Abdomen1__20130625-img.nii.gz": 2,
-    "---Airway1__20031216-img.nii.gz": 3,
-    "---Airway1__20041020-img.nii.gz": 4,
-    "---Airway1__20060907-img.nii.gz": 5,
-    "---Airway2__20080707-img.nii.gz": 6,
-    "---Airway2__20110124-img.nii.gz": 7,
-    "---Airway2__20130204-img.nii.gz": 8,
-    "---Back1__20070330-img.nii.gz": 9,
-    "---Back1__20081117-img.nii.gz": 10,
-    "---Back1__20100323-img.nii.gz": 11,
-    "---Brachial-plexus1__20130205-img.nii.gz": 12,
-    "---Br-plexus1__20120223-img.nii.gz": 13,
-    "---Br-plexus1__20120625-img.nii.gz": 14,
-    "---Chest2__20011227-img.nii.gz": 15,
-    "---Chest2__20050914-img.nii.gz": 16,
-    "---Chest2__20080918-img.nii.gz": 17,
-    "---Chest3__20081222-img.nii.gz": 18,
-    "---Chest3__20110602-img.nii.gz": 19,
-    "---Chest3__20131122-img.nii.gz": 20,
-    "---Face1__20100719-img.nii.gz": 21,
-    "---Face1__20110418-img.nii.gz": 22,
-    "---Face1__20120924-img.nii.gz": 23,
-    "---Leg1__20080714-img.nii.gz": 24,
-    "---Leg1__20100726-img.nii.gz": 25,
-    "---Leg1__20110228-img.nii.gz": 26,
-    "---Neck1__20020726-img.nii.gz": 27,
-    "---Neck1__20040315-img.nii.gz": 28,
-    "---Neck1__20050527-img.nii.gz": 29,
-    "---Orbit1__20030225-img.nii.gz": 30,
-    "---Orbit1__20050217-img.nii.gz": 31,
-    "---Orbit1__20061016-img.nii.gz": 32,
-    "---Orbit2__20090403-img.nii.gz": 33,
-    "---Orbit2__20121018-img.nii.gz": 34,
-    "---Orbit2__20140520-img.nii.gz": 35,
-    "---Pelvis1__20030916-img.nii.gz": 36,
-    "---Pelvis1__20060109-img.nii.gz": 37,
-    "---Pelvis1__20100726-img.nii.gz": 38,
-    "---Pelvis2__20090114-img.nii.gz": 39,
-    "---Pelvis2__20100112-img.nii.gz": 40,
-    "---Pelvis2__20120423-img.nii.gz": 41,
-    "---Thigh1__20071019-img.nii.gz": 42,
-    "---Thigh1__20100712-img.nii.gz": 43,
-    "---Thigh1__20120106-img.nii.gz": 44,
-}
-
-
-def load_extra_data_paths():
-    data_dir = DATA_ROOT / "NCI_NF1_InaLabeled"
-    path_list = list(data_dir.glob("*img.nii.gz"))
-    dataset = {}
-    for path in path_list:
-        pid = extra_name_mapping[path.name]
-        dataset[pid] = {"img_path": path, "lab_path": path.parent / path.name.replace("img", "mask")}
-    return dataset
-
-
-def load_box_csv():
-    box_file = DATA_ROOT / "nf_box.csv"
-    box_df = pd.read_csv(box_file)
-    return box_df

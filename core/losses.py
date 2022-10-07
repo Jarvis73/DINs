@@ -14,30 +14,7 @@
 #
 # =================================================================================
 
-from collections import defaultdict
-import numpy as np
 import tensorflow as tf
-from tensorflow import keras as K
-from tensorflow.python.keras.metrics import MeanMetricWrapper
-from medpy import metric as mtr     # pip install medpy
-from sacred import Ingredient
-
-
-def lm_arguments():
-    """ ==> Loss/Metrics Arguments"""
-    loss_type = "xentropy"      # str, Loss type. [xentropy]
-    loss_weight_type = "none"   # str, Weights for alleviating class imbalance problem. [none/numerical]
-    loss_numeric_w = []         # list, [numerical] One value per class.
-    train_metric = "none"      # str, Training metric name used during training. [Dice/VOE/RVD/IoU]
-    eval_metric = "Dice"       # str, Evaluation metric name. [Dice/VOE/RVD/IoU]
-
-
-@loss_metric_ingredient.capture
-def get_loss_fn(loss_type):
-    if loss_type == "xentropy":
-        return K.losses.SparseCategoricalCrossentropy(from_logits=True)
-    else:
-        raise ValueError(f"Unsupported loss type: {loss_type}. [xentropy]")
 
 
 def sample_weight(ground_truth, num_classes, loss_weight_type, loss_numeric_w):

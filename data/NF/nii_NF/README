@@ -1,0 +1,8 @@
+Neurofibroma training/evaluation data (for cross-validation) is placed here:
+
+volume-001.nii.gz
+volume-002.nii.gz
+......
+segmentation-001.nii.gz
+segmentation-002.nii.gz
+......

@@ -50,7 +50,7 @@ class Trainer(object):
         self.train_loss_metric, self.eval_loss_metric, self.eval_acc_metric = get_metric_fns()
         self.callbacks = [self.solver.lr_callback]
 
-        logger.info(f"           ==> Trainer")
+        logger.info(" " * 11 + "==> Trainer")
 
     def record_metric(self, loss_metric, loss, acc_metrics, label, predictions):
         loss_metric(loss)
@@ -59,6 +59,7 @@ class Trainer(object):
             pred = tf.one_hot(tf.argmax(predictions, axis=-1), self.num_classes)[..., 1]
             acc_metrics(lab, pred)
 
+    @tf.function
     def train_step(self, feature, label, weight=None):
         images = tf.where(tf.math.is_nan(feature[0]), tf.zeros_like(feature[0]), feature[0])
         check_op2 = tf.Assert(tf.reduce_all(tf.logical_not(tf.math.is_nan(feature[1]))),
@@ -79,6 +80,7 @@ class Trainer(object):
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         self.record_metric(self.train_loss_metric, loss, None, label, predictions)
 
+    @tf.function
     def eval_step(self, feature, label):
         predictions = self.model(feature, training=False)
         loss = self.cross_entropy(label, predictions)
@@ -97,26 +99,21 @@ class Trainer(object):
             total += f" {acc_metric.name}: {acc_metric.result():.3f}"
         return total
 
-    def variables_initializer(self, input_shape):
-        self.model.build(input_shape)
-        _ = self.optimizer.iterations
-        self.optimizer._create_hypers()
-        self.optimizer._create_slots(self.model.trainable_variables)
-
     def start_training_loop(self, train_dataset, val_dataset):
         train_dataset, input_shape = train_dataset
         eval_dataset = val_dataset[0]
-        if self.opt.tf_func:
-            self.train_step = tf.function(self.train_step)
-            self.eval_step = tf.function(self.eval_step)
 
         for callback in self.callbacks:
+            # Register model to callbacks
             callback.set_model(self.model)
             callback.on_train_begin()
 
-        self.variables_initializer(input_shape)
+        # Use input_shape to initialize all variables and pre-build computation graph
+        self.model.build(input_shape)
+
+        # Start training loop
         self.reset_states()
-        for epoch in range(1, self.opt.epochs + 1):
+        for epoch in range(self.opt.epochs):
             for callback in self.callbacks:
                 callback.on_epoch_begin(epoch)
 
@@ -143,7 +140,7 @@ class Trainer(object):
                     "learning_rate": self.optimizer.lr.numpy(),
                     self.eval_acc_metric.name: self.eval_acc_metric.result().numpy()
                 })
-            if epoch != self.opt.epochs:
+            if epoch != self.opt.epochs - 1:
                 self.reset_states()
 
         for callback in self.callbacks:
@@ -163,22 +160,6 @@ class Trainer(object):
 #
 ################################################################################################
 
-def test_arguments():
-    tta = True                          # bool, Enable test time augmentation (flip)
-    metrics = ["Dice", "VOE", "RVD"]    # list, Test metric names. [Dice/VOE/RVD/ASSD/RMSD/MSD]
-    save_predict = False                # bool
-    save_dir = "predict"                # str, Save directory
-    ckpt_dir = "ckpt"                   # str, Checkpoint directory, 'checkpoint' file must exist
-    ckpt = ""                           # str, Full path, test on specific checkpoint
-    inter_thresh = 0.85                 # float, Threshold of the segmentation goal
-    max_iter = 20                       # int, Maximum iters for each image in interaction
-    old_ckpt = ""                       # str, checkpoint v1
-    name_mapping_file = ""              # str, mapping dict from file
-    test_set = "eval"                   # str, data set for testing [eval/train]
-    debug = False
-    gamma = 1.                          # float, scale of ExpDT
-    log = False                         # bool, log interactive points or not
-
 
 def inter_simulation_test(pred, ref, ndim=2, memory=None):
     """
@@ -188,7 +169,7 @@ def inter_simulation_test(pred, ref, ndim=2, memory=None):
     1. Compute false positive and false negative areas
     2. Connectivity analysis
     3. Choice the largest error region
-    4. Please a new click on the center of the error region
+    4. Please a new click in the center of the error region
     5. Determine foreground or background pixel
 
     Parameters
@@ -265,22 +246,41 @@ def inter_simulation_test(pred, ref, ndim=2, memory=None):
     return point.tolist(), is_fg
 
 
-def update_guide_simul(pred, ref, guide, cfg, iteration, pos_col, ndim, img=None, ctr_zoom_scale=None):
-    """ Add a interactive point by simulation.
+def geo_guide(pts, image, ctr_zoom_scale, opt):
+    if len(pts) > 0:
+        # Down-sample for acceleration
+        int_ctr = (np.array(pts, np.float32).reshape(-1, 2) * ctr_zoom_scale / [1, 2, 2]).astype(np.int32)
+        gd = np_ops.gen_guide_geo_3d(image, int_ctr, opt.geo_lamb, opt.geo_iter)
+    else:
+        gd = np.zeros_like(image, np.float32)
+    return gd
+
+
+def update_guide_simul(pred, ref, guide, opt, iteration, pos_col, ndim, img=None, ctr_zoom_scale=None):
+    """ Add an interactive point by simulation.
 
     Parameters
     ----------
-    pred: np.ndarray, with shape [height, width] / [depth, height, width]
-    ref: np.ndarray, with shape [height, width] / [depth, height, width]
-    guide: np.ndarray, with shape [height, width] / [depth, height, width]
-    cfg: utils.dict_kits.Map, `data` configuration
-    iteration: a list of two integers, accumulate interactions of this case
-    pos_col: [[...], [...]], accumulate points of interactions.
-             FG points are in the first list and BG points are in the second.
-    ndim: int, 2/3, dimension
-    img: np.ndarray, with shape [test_height, test_width] / [test_depth, test_height, test_width],
-                     for computing geodesic guide
-    ctr_zoom_scale: np.ndarray, with shape [2] / [3], for computing geodesic guide
+    pred: np.ndarray
+        with shape [height, width] / [depth, height, width]
+    ref: np.ndarray
+        with shape [height, width] / [depth, height, width]
+    guide: np.ndarray
+        with shape [height, width] / [depth, height, width]
+    opt:
+        configurations
+    iteration:
+        a list of two integers, accumulate interactions of this case
+    pos_col:
+        [[...], [...]], accumulate points of interactions.
+        FG points are in the first list and BG points are in the second.
+    ndim: int
+        2 or 3, dimension
+    img: np.ndarray
+        with shape [test_height, test_width] / [test_depth, test_height, test_width],
+        for computing geodesic guide
+    ctr_zoom_scale: np.ndarray
+        with shape [2] / [3], for computing geodesic guide
 
     Returns
     -------
@@ -289,6 +289,7 @@ def update_guide_simul(pred, ref, guide, cfg, iteration, pos_col, ndim, img=None
     fg: int, 0/1, 0 for fg and 1 for bg
     pos_col: [[...], [...]], updated parameter
     """
+    # Initialize an empty pred
     if pred is None:
         pred = np.zeros_like(ref, dtype=np.uint8)
     memory = np.concatenate((np.array(pos_col[0]).reshape(-1, ndim), np.array(pos_col[1]).reshape(-1, ndim)), axis=0) \
@@ -298,64 +299,28 @@ def update_guide_simul(pred, ref, guide, cfg, iteration, pos_col, ndim, img=None
         return guide, None, None, pos_col
     pos_col[fg].append(pos)
 
-    def geo_guide(pts, image, downsampling=True):
-        if len(pts) > 0:
-            if downsampling:
-                int_ctr = (np.array(pts, np.float32).reshape(-1, ndim) * ctr_zoom_scale / [1, 2, 2]).astype(np.int32)
-            else:
-                int_ctr = (np.array(pts, np.float32).reshape(-1, ndim) * ctr_zoom_scale).astype(np.int32)
-            gd = image_np_ops.gen_guide_geo_3d(image, int_ctr, cfg.geo_lamb, cfg.geo_iter)
-        else:
-            gd = np.zeros_like(image, np.float32)
-        return gd
-
-    if cfg.guide_type == "exp":
-        cur_guide = image_np_ops.gen_guide_nd(
-            ref.shape, np.array([pos]), np.ones((1, ndim), np.float32) * cfg.exp_stddev, euclidean=False)
-        if cfg.std_split:
-            cur_guide2 = image_np_ops.gen_guide_nd(
-                ref.shape, np.array([pos]), np.ones((1, ndim), np.float32) * [1., 5., 5.], euclidean=False)
+    if opt.guide == "exp":
+        cur_guide = np_ops.gen_guide_nd(
+            ref.shape, np.array([pos]), np.ones((1, ndim), np.float32) * opt.exp_stddev, euclidean=False)
         update_op = np.maximum
-    elif cfg.guide_type == "euc":
-        cur_guide = image_np_ops.gen_guide_nd(
+    elif opt.guide == "euc":
+        cur_guide = np_ops.gen_guide_nd(
             ref.shape, np.array([pos]), euclidean=True)
         update_op = np.minimum
-    elif cfg.guide_type == "euc_small":
-        down_ctr = np.array([pos]) / [1, 2, 2]
-        depth, height, width = ref.shape
-        down_target_shape = [depth, height // 2, width // 2]
-        gd = image_np_ops.gen_guide_nd(down_target_shape, down_ctr, euclidean=True)
-        zoom_scale = np.array([1, height / gd.shape[1], width / gd.shape[2]])
-        cur_guide = ndi.zoom(gd, zoom_scale, order=1)
-        update_op = np.minimum
-    elif cfg.guide_type == "geo":
+    elif opt.guide == "geo":
         if ndim != 3:
-            raise ValueError(f"Unsupported image dimension: {ndim}. [2]")
+            raise ValueError(f"Unsupported {ndim}D image for geodestic. [2]")
         down_img = img[:, ::2, ::2]
-        fg_gd = geo_guide(pos_col[0], down_img)
-        bg_gd = geo_guide(pos_col[1], down_img)
-        guide = np.stack((fg_gd, bg_gd), axis=-1)
-        zoom_scale = np.array(img.shape + (1,), np.float32) / np.array(fg_gd.shape + (1,), np.float32)
-        guide = ndi.zoom(guide, zoom_scale, order=1)
-    elif cfg.guide_type == "geo_large":
-        if ndim != 3:
-            raise ValueError(f"Unsupported image dimension: {ndim}. [2]")
-        down_img = img[:, ::2, ::2]
-        fg_gd = geo_guide(pos_col[0], down_img, downsampling=True)
-        bg_gd = geo_guide(pos_col[1], down_img, downsampling=True)
+        fg_gd = geo_guide(pos_col[0], down_img, ctr_zoom_scale, opt)
+        bg_gd = geo_guide(pos_col[1], down_img, ctr_zoom_scale, opt)
         guide = np.stack((fg_gd, bg_gd), axis=-1)
         zoom_scale = np.array(img.shape + (1,), np.float32) / np.array(fg_gd.shape + (1,), np.float32)
         guide = ndi.zoom(guide, zoom_scale, order=1)
     else:
-        raise ValueError(f"Unsupported guide type: {cfg.guide_type}. [none/exp/euc/geo]")
-    if cfg.guide_type in ["exp", "euc", "euc_small"]:
+        raise ValueError(f"Unsupported guide type: {opt.guide}. [none/exp/euc/geo]")
+    if opt.guide in ["exp", "euc"]:
         if guide is None:
-            if cfg.std_split:
-                guide = np.zeros(ref.shape + (4,), dtype=np.float32)
-            else:
-                guide = np.zeros(ref.shape + (2,), dtype=np.float32)
-        if cfg.std_split:
-            guide[..., fg + 2] = update_op(guide[..., fg + 2], cur_guide2) if guide[..., fg + 2].max() > 0 else cur_guide2
+            guide = np.zeros(ref.shape + (2,), dtype=np.float32)
         guide[..., fg] = update_op(guide[..., fg], cur_guide) if guide[..., fg].max() > 0 else cur_guide
     iteration[fg] += 1
     return guide, pos, fg, pos_col
@@ -374,7 +339,7 @@ class Evaluator2D(object):
         self.logger = logger
         self.model = model
         self.timer = Timer()
-        self.num_classes = len(self.opt.n_class)
+        self.num_classes = opt.n_class
         # build metric functions
         self.eval_metrics = MetricGroups(["NF"])
         self.tta_dict = {
@@ -399,21 +364,16 @@ class Evaluator2D(object):
         self.eval_metrics.add(total)
         return total.copy()
 
-    def map_value(self, variables, mapping):
-        import json
-        with open(self.cfg.test.name_mapping_file) as f:
-            names = json.load(f)
-        for v in variables:
-            np_value = mapping[names[v.name]]
-            v.assign(tf.convert_to_tensor(np_value, tf.float32))
-
     def load_weights(self, input_shape):
+        if not (Path(self.opt.resume_dir) / "checkpoint").exists():
+            raise FileNotFoundError(f'Checkpoint file not found: {Path(self.opt.resume_dir) / "checkpoint"}')
         self.model.build(input_shape)
         ckpt = tf.train.Checkpoint(model=self.model)
         ckpt_path = tf.train.latest_checkpoint(self.opt.resume_dir)
         ckpt.restore(ckpt_path).expect_partial()
-        self.logger.info(f"Restore checkpoint from {ckpt_path}")
+        self.logger.info(' ' * 11 + f"==> Restore checkpoint from {ckpt_path}")
 
+    @tf.function
     def eval_step(self, feature):
         if isinstance(feature, list) and len(feature) == 1:
             feature = feature[0]
@@ -424,7 +384,7 @@ class Evaluator2D(object):
     def eval_tta(self, feature):
         probs = [self.eval_step(feature)]
         for i in range(1, 4):
-            if self.cfg.data.random_flip & i > 0:
+            if self.opt.flip & i > 0:
                 axes = self.tta_dict[i]
                 new_feature = [tf.reverse(im, axes) for im in feature]
                 probs.append(tf.reverse(self.eval_step(new_feature), axes))
@@ -467,7 +427,7 @@ class Evaluator2D(object):
         final_pred: np.ndarray, final prediction of this case
         """
         ori_shape_cv = tuple(label.shape[:0:-1])
-        run_shape_cv = (self.cfg.data.test_width, self.cfg.data.test_height)
+        run_shape_cv = (self.opt.test_width, self.opt.test_height)
         final_pred = np.zeros_like(label, dtype=np.uint8)
         case_inters = [0, 0]
         for si, img in volume_gen:
@@ -478,7 +438,7 @@ class Evaluator2D(object):
             pos_col = [[], []]      # Temporarily not used
             while True:
                 guide, new_pos, fg, pos_col = update_guide_simul(
-                    pred, label[si], guide, self.cfg.data, num_iter, pos_col, ndim=2)
+                    pred, label[si], guide, self.opt, num_iter, pos_col, ndim=2)
                 last_pos = new_pos
                 resized_guide = cv2.resize(guide, run_shape_cv, interpolation=cv2.INTER_LINEAR)
                 feature[1] = tf.convert_to_tensor(resized_guide[None], tf.float32)
@@ -494,7 +454,7 @@ class Evaluator2D(object):
                 dice = compute_dice(pred, label[si])
                 print("{:.3f}->".format(dice), end="", flush=True)
                 # Reach the dice threshold or threshold of the number of the interactions
-                if dice >= self.cfg.test.inter_thresh or num_iter[0] + num_iter[1] >= self.cfg.test.max_iter:
+                if dice >= self.opt.inter_thresh or num_iter[0] + num_iter[1] >= self.opt.max_iter:
                     print(" Number iters: {}/{}".format(num_iter[0], num_iter[1]))
                     case_inters[0] += num_iter[0]
                     case_inters[1] += num_iter[1]
@@ -513,12 +473,9 @@ class Evaluator2D(object):
 
         for sample, meta_data, volume_gen, label in eval_dataset:
             with self.timer.start():
-                if self.opt.guide == "none":
-                    final_pred = self.eval_auto(volume_gen, label)
-                else:   # use guide
-                    final_pred, case_inters = self.eval_inter_simul(volume_gen, label, sample)
-                    total_inters[0] += case_inters[0]
-                    total_inters[1] += case_inters[1]
+                final_pred, case_inters = self.eval_inter_simul(volume_gen, label, sample)
+                total_inters[0] += case_inters[0]
+                total_inters[1] += case_inters[1]
                 case_metrics = self.record_metric(label, final_pred)
 
             # Save prediction
@@ -541,25 +498,23 @@ class Evaluator2D(object):
             tp, fp, fn = metrics.pop("tp"), metrics.pop("fp"), metrics.pop("fn")
             lst = ["{}: {:.3f} ".format(k, v) for k, v in metrics.items()]
             lst.append("G_Dice: {:.3f} ".format(2 * tp / (2 * tp + fn + fp)))
-            if self.opt.guide != "none":
-                lst.append("(Avg inters: {:.1f}/{:.1f})".format(
-                    total_inters[0] / self.timer.calls, total_inters[1] / self.timer.calls))
+            lst.append("(Avg inters: {:.1f}/{:.1f})".format(
+                total_inters[0] / self.timer.calls, total_inters[1] / self.timer.calls))
             self.logger.info(f"    {cls} ==> " + "".join(lst))
 
         return
 
 
-class Evaluator(object):
-    def __init__(self, opt, logger, model):
+class Evaluator3D(object):
+    def __init__(self, opt, logger, model, run):
         self.opt = opt
         self.logger = logger
         self.model = model
+        self.logdir = Path(run.logdir_)
         self.timer = Timer()
-        self.num_classes = len(self.opt.n_class)
+        self.num_classes = opt.n_class
         # build metric functions
         self.eval_metrics = MetricGroups(["NF"])
-        if self.opt.tf_func:
-            self.eval_step = tf.function(self.eval_step)
         self.eval_ops = self.eval_tta if self.opt.tta else self.eval_step
 
         self.tta_dict = {
@@ -567,23 +522,44 @@ class Evaluator(object):
             5: [1, 3], 6: [1, 2], 7: [1, 2, 3]
         }
 
-        logger.info(f"           ==> Evaluator3D")
+        logger.info(" " * 11 + "==> Evaluator3D")
 
     def reset_states(self):
         self.eval_metrics.reset()
         self.timer.reset()
 
+    def record_metric(self, label, predictions):
+        lab = np_ops.one_hot(label, self.num_classes, axis=0)[1]
+        pred = np_ops.one_hot(predictions, self.num_classes, axis=0)[1]
+        cls_metrics = metric_3d(pred, lab, metrics_eval=self.opt.metrics)
+        conf = ConfusionMatrix(pred, lab)
+        conf.compute()
+        cls_metrics.update({"fn": conf.fn, "fp": conf.fp, "tp": conf.tp})
+        total = {"NF": cls_metrics}
+        self.eval_metrics.add(total)
+        return total.copy()
+
     def load_weights(self, input_shape):
+        if not (Path(self.opt.resume_dir) / "checkpoint").exists():
+            raise FileNotFoundError(f'Checkpoint file not found: {Path(self.opt.resume_dir) / "checkpoint"}')
         self.model.build(input_shape)
         ckpt = tf.train.Checkpoint(model=self.model)
         ckpt_path = tf.train.latest_checkpoint(self.opt.resume_dir)
         ckpt.restore(ckpt_path).expect_partial()
-        self.logger.info(f"Restore checkpoint from {ckpt_path}")
+        self.logger.info(' ' * 11 + f"==> Restore checkpoint from {ckpt_path}")
+
+    @tf.function
+    def eval_step(self, feature):
+        if isinstance(feature, list) and len(feature) == 1:
+            feature = feature[0]
+        predictions = self.model(feature, training=False)
+        probability = tf.nn.softmax(predictions, axis=-1)
+        return probability
 
     def eval_tta(self, feature):
         probs = [self.eval_step(feature)]
         for i in range(1, 8):
-            if self.cfg.data.random_flip & i > 0:
+            if self.opt.flip & i > 0:
                 axes = self.tta_dict[i]
                 new_feature = [tf.reverse(im, axes) for im in feature]
                 probs.append(tf.reverse(self.eval_step(new_feature), axes))
@@ -591,7 +567,7 @@ class Evaluator(object):
         return avg_prob
 
     def eval_auto(self, volume, label):
-        """ Evaluate automatically
+        """ Evaluate automatically (without guides)
 
         Parameters
         ----------
@@ -636,49 +612,25 @@ class Evaluator(object):
                                 mode="constant", constant_values=0)
         case_inters = [0, 0]
         print("(Case {:3d}) Interacting: ".format(int(sample.pid)), end="", flush=True)
-        if self.cfg.data.std_split:
-            feature = [tf.convert_to_tensor(volume[None, ..., None], tf.float32), None, None]
-        else:
-            feature = [tf.convert_to_tensor(volume[None, ..., None], tf.float32), None]
+        feature = [tf.convert_to_tensor(volume[None, ..., None], tf.float32), None]
         guide, pred = None, None
         num_iter = [0, 0]
         pos_col = [[], []]      # Temporarily not used
-        data_save_counter = 0
         while True:
-            if "geo" not in self.cfg.data.guide_type:
-                geo_kwargs = {}
-            else:
-                geo_kwargs = {"img": volume, "ctr_zoom_scale": zoom_scale[:-1]}
+            geo_kwargs = {"img": volume, "ctr_zoom_scale": zoom_scale[:-1]} \
+                if "geo" in self.opt.guide else {}
             guide, new_pos, fg, pos_col = update_guide_simul(
-                pred, label_bool, guide, self.cfg.data, num_iter, pos_col, ndim=3, **geo_kwargs)
-            if self.cfg.test.log:
-                print("fg" * (fg == 0) + "bg" * (fg == 1), new_pos, "   ", end="")
-            if self.cfg.test.debug:
-                print(new_pos, "   ", end="")
-            if "geo" not in self.cfg.data.guide_type:
-                resized_guide = ndi.zoom(guide, zoom_scale, order=1)
-            else:
-                resized_guide = guide.copy()
-            if self.cfg.data.std_split:
-                feature[1] = tf.convert_to_tensor(resized_guide[None, ..., :2] * self.cfg.test.gamma, tf.float32)
-                feature[2] = tf.convert_to_tensor(resized_guide[None, ..., 2:] * self.cfg.test.gamma, tf.float32)
-            else:
-                feature[1] = tf.convert_to_tensor(resized_guide[None] * self.cfg.test.gamma, tf.float32)
+                pred, label_bool, guide, self.opt, num_iter, pos_col, ndim=3, **geo_kwargs)
+            resized_guide = guide.copy() \
+                if "geo" in self.opt.guide else ndi.zoom(guide, zoom_scale, order=1)
+            feature[1] = tf.convert_to_tensor(resized_guide[None] * self.opt.gamma, tf.float32)
             pred = self.eval_ops(feature)     # [test_height, test_width]
             pred = tf.argmax(pred, axis=-1).numpy().astype(np.uint8)[0]
-            if self.cfg.test.debug:
-                import pickle, zlib
-                with open(f"data_{data_save_counter}.pkl.gz", "wb") as f:
-                    s = pickle.dumps((feature[0].numpy(), feature[1].numpy(), label, pred), pickle.HIGHEST_PROTOCOL)
-                    f.write(zlib.compress(s))
-                    data_save_counter += 1
             pred = ndi.zoom(pred, 1. / zoom_scale[:-1], order=0)
             dice = compute_dice(pred, label_bool)
             print("{:.3f}->".format(dice), end="", flush=True)
-            if self.cfg.test.debug:
-                input()
             # Reach the dice threshold or threshold of the number of the interactions
-            if dice >= self.cfg.test.inter_thresh or num_iter[0] + num_iter[1] >= self.cfg.test.max_iter:
+            if dice >= self.opt.inter_thresh or num_iter[0] + num_iter[1] >= self.opt.max_iter:
                 print(" Number iters: {}/{}".format(num_iter[0], num_iter[1]))
                 case_inters[0] += num_iter[0]
                 case_inters[1] += num_iter[1]
@@ -688,32 +640,41 @@ class Evaluator(object):
         return pred, case_inters
 
     def start_evaluating_loop(self, eval_dataset):
+        opt = self.opt
         eval_dataset, input_shape = eval_dataset
         self.load_weights(input_shape)
         self.reset_states()
-        save_dir = Path(self.cfg.g.model_dir) / self.cfg.test.save_dir
+        save_dir = self.logdir / opt.save_dir
+        if opt.save_predict:
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info(f'-' * 50)
+        self.logger.info(f'Target thresh: {opt.inter_thresh}')
+        self.logger.info(f'Max simulated interactions: {opt.max_iter}')
+        self.logger.info(f'Use predefined bounding boxes: {opt.use_box}')
+        self.logger.info(f'Enable test-time augmentation (tta): {opt.tta}')
+        self.logger.info(f'Saving directory: {save_dir if opt.save_predict else "[Disabled]"}')
+        self.logger.info(f'Test set: {opt.test_set}')
+        self.logger.info(f'Number of samples: {opt.test_n if opt.test_n >= 0 else "[ALL]"}')
+        self.logger.info(f'-' * 50)
+        self.logger.info(f'Start testing...')
         total_inters = [0, 0]
         for sample, meta_data, volume, label in eval_dataset:
             self.timer.tic()
-            if self.cfg.data.guide_type == "none":
-                final_pred = self.eval_auto(volume, label)
-            else:   # use guide
-                final_pred, case_inters = self.eval_inter_simul(volume, label, sample)
-                total_inters[0] += case_inters[0]
-                total_inters[1] += case_inters[1]
+            final_pred, case_inters = self.eval_inter_simul(volume, label, sample)
+            total_inters[0] += case_inters[0]
+            total_inters[1] += case_inters[1]
             case_metrics = self.record_metric(label, final_pred)
             self.timer.toc()
 
             # Save prediction
-            if self.cfg.test.save_predict:
-                if not save_dir.exists():
-                    save_dir.mkdir()
+            if opt.save_predict:
                 save_file = save_dir / f"predict-{int(sample.pid)}.nii.gz"
-                misc.write_nii(final_pred, meta_data, save_file)
+                write_nii(final_pred, meta_data, save_file)
             self.logger.info(
                 f"Evaluate {int(sample.pid)}"
                 + " - Elapse {:.1f}s".format(self.timer.diff)
-                + " - (Saved)" * self.cfg.test.save_predict
+                + " - (Saved)" * opt.save_predict
             )
             for cls, metrics in case_metrics.items():
                 self.logger.info(f"    {cls} ==> " + "".join(["{}: {:.3f} ".format(k, v) for k, v in metrics.items()]))
@@ -721,24 +682,21 @@ class Evaluator(object):
         self.logger.info(
             f"Total infer {self.timer.calls} cases"
             + " - Elapse {:.1f}s".format(self.timer.total_time)
-            + " - {:.1f} s/it".format(self.timer.average_time)
+            + " - {:.1f} s/it".format(self.timer.spc)
         )
         for cls, metrics in self.eval_metrics.result().items():
             tp, fp, fn = metrics.pop("tp"), metrics.pop("fp"), metrics.pop("fn")
             lst = ["{}: {:.3f} ".format(k, v) for k, v in metrics.items()]
             lst.append("G_Dice: {:.3f}".format(2 * tp / (2 * tp + fn + fp)))
-            if self.cfg.data.guide_type != "none":
-                lst.append("(Avg inters: {:.1f}/{:.1f})".format(
-                    total_inters[0] / self.timer.calls, total_inters[1] / self.timer.calls))
+            lst.append("(Avg inters: {:.1f}/{:.1f})".format(
+                total_inters[0] / self.timer.calls, total_inters[1] / self.timer.calls))
             self.logger.info(f"    {cls} ==> " + "".join(lst))
-
-        return
 
 
 class Evaluator3DWithBox(Evaluator3D):
-    def __init__(self, opt, logger, model):
+    def __init__(self, opt, logger, model, run):
         """ Evaluator class for 3D models. Boxes are used during retriving data """
-        super(Evaluator3D, self).__init__(opt, logger, model)
+        super(Evaluator3DWithBox, self).__init__(opt, logger, model, run)
         self.tta_dict = {
             1: [3], 2: [2], 3: [2, 3], 4: [1],
             5: [1, 3], 6: [1, 2], 7: [1, 2, 3]
@@ -776,10 +734,7 @@ class Evaluator3DWithBox(Evaluator3D):
             if data_mask is not None:
                 data_mask = np.pad(data_mask, ((0, volume.shape[0] - label.shape[0]), (0, 0), (0, 0)),
                                    mode="constant", constant_values=0)
-        if self.cfg.data.std_split:
-            feature = [tf.convert_to_tensor(volume[None, ..., None], tf.float32), None, None]
-        else:
-            feature = [tf.convert_to_tensor(volume[None, ..., None], tf.float32), None]
+        feature = [tf.convert_to_tensor(volume[None, ..., None], tf.float32), None]
         guide, pred = None, None
         num_iter = [0, 0]
         pos_col = [[], []]      # Temporarily not used
@@ -787,33 +742,17 @@ class Evaluator3DWithBox(Evaluator3D):
         if crop_box is not None:
             final_pred_backup = final_pred[crop_box].copy()
         while True:
-            if "geo" not in self.cfg.data.guide_type:
-                geo_kwargs = {}
-            else:
-                geo_kwargs = {"img": volume, "ctr_zoom_scale": zoom_scale[:-1]}
+            geo_kwargs = {"img": volume, "ctr_zoom_scale": zoom_scale[:-1]} \
+                if "geo" in self.opt.guide else {}
             guide, new_pos, fg, pos_col = update_guide_simul(
-                pred, label_bool, guide, self.cfg.data, num_iter, pos_col, ndim=3, **geo_kwargs)
-            if self.cfg.test.debug:
-                print(new_pos, "   ", end="")
-            if "geo" not in self.cfg.data.guide_type:
-                resized_guide = ndi.zoom(guide, zoom_scale, order=1)
-            else:
-                resized_guide = guide.copy()
-            if self.cfg.data.std_split:
-                feature[1] = tf.convert_to_tensor(resized_guide[None, ..., :2] * self.cfg.test.gamma, tf.float32)
-                feature[2] = tf.convert_to_tensor(resized_guide[None, ..., 2:] * self.cfg.test.gamma, tf.float32)
-            else:
-                feature[1] = tf.convert_to_tensor(resized_guide[None] * self.cfg.test.gamma, tf.float32)
+                pred, label_bool, guide, self.opt, num_iter, pos_col, ndim=3, **geo_kwargs)
+            resized_guide = guide.copy() \
+                if "geo" in self.opt.guide else ndi.zoom(guide, zoom_scale, order=1)
+            feature[1] = tf.convert_to_tensor(resized_guide[None] * self.opt.gamma, tf.float32)
             pred = self.eval_ops(feature)     # [test_height, test_width]
             pred = tf.argmax(pred, axis=-1).numpy().astype(np.uint8)[0]
             if data_mask is not None:
                 pred = pred * data_mask
-            if self.cfg.test.debug:
-                import pickle, zlib
-                with open(f"data_{data_save_counter}.pkl.gz", "wb") as f:
-                    s = pickle.dumps((feature[0].numpy(), feature[1].numpy(), label, pred), pickle.HIGHEST_PROTOCOL)
-                    f.write(zlib.compress(s))
-                    data_save_counter += 1
             pred = ndi.zoom(pred, 1. / zoom_scale[:-1], order=0)
             if label.shape[0] != volume.shape[0]:
                 patch_pred = pred[:label.shape[0] - volume.shape[0]]
@@ -825,18 +764,30 @@ class Evaluator3DWithBox(Evaluator3D):
                 final_pred = patch_pred
             dice = compute_dice(final_pred, final_label)
             print("{:.3f}->".format(dice), end="", flush=True)
-            if self.cfg.test.debug:
-                input()
             # Reach the dice threshold or threshold of the number of the interactions
-            if dice >= self.cfg.test.inter_thresh or num_iter[0] + num_iter[1] >= max_iter:
+            if dice >= self.opt.inter_thresh or num_iter[0] + num_iter[1] >= max_iter:
                 break
         return patch_pred, num_iter
 
     def start_evaluating_loop(self, eval_dataset):
+        opt = self.opt
         eval_dataset, input_shape = eval_dataset
         self.load_weights(input_shape)
         self.reset_states()
-        save_dir = Path(self.cfg.g.model_dir) / self.cfg.test.save_dir
+        save_dir = self.logdir / opt.save_dir
+        if opt.save_predict:
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info(f'-' * 50)
+        self.logger.info(f'Target thresh: {opt.inter_thresh}')
+        self.logger.info(f'Max simulated interactions: {opt.max_iter}')
+        self.logger.info(f'Use predefined bounding boxes: {opt.use_box}')
+        self.logger.info(f'Enable test-time augmentation (tta): {opt.tta}')
+        self.logger.info(f'Saving directory: {save_dir if opt.save_predict else "[Disabled]"}')
+        self.logger.info(f'Test set: {opt.test_set}')
+        self.logger.info(f'Number of samples: {opt.test_n if opt.test_n >= 0 else "[ALL]"}')
+        self.logger.info(f'-' * 50)
+        self.logger.info(f'Start testing...')
         total_inters = [0, 0]
         finish_case = False
         final_pred = None
@@ -849,13 +800,10 @@ class Evaluator3DWithBox(Evaluator3D):
                 final_pred = np.zeros(meta_data['dim'][3:0:-1], np.uint8)
             if crop_box is not None:
                 bid, total, crop_box = crop_box
-            if self.cfg.data.guide_type == "none":
-                patch_pred = self.eval_auto(volume, lab_patch)
-            else:   # use guide
-                patch_pred, patch_iter = self.eval_inter_simul_with_box(
-                    volume, lab_patch, max_iter, data_mask, final_pred, label, crop_box)
-                case_inters[0] += patch_iter[0]
-                case_inters[1] += patch_iter[1]
+            patch_pred, patch_iter = self.eval_inter_simul_with_box(
+                volume, lab_patch, max_iter, data_mask, final_pred, label, crop_box)
+            case_inters[0] += patch_iter[0]
+            case_inters[1] += patch_iter[1]
             if crop_box is None:
                 # Full image inference
                 finish_case = True
@@ -874,15 +822,13 @@ class Evaluator3DWithBox(Evaluator3D):
                 self.timer.toc()
 
                 # Save prediction
-                if self.cfg.test.save_predict:
-                    if not save_dir.exists():
-                        save_dir.mkdir()
+                if self.opt.save_predict:
                     save_file = save_dir / f"predict-{int(sample.pid)}.nii.gz"
-                    misc.write_nii(final_pred, meta_data, save_file)
+                    write_nii(final_pred, meta_data, save_file)
                 self.logger.info(
                     f"Evaluate {int(sample.pid)}"
                     + " - Elapse {:.1f}s".format(self.timer.diff)
-                    + " - (Saved)" * self.cfg.test.save_predict
+                    + " - (Saved)" * self.opt.save_predict
                 )
                 for cls, metrics in case_metrics.items():
                     self.logger.info(f"    {cls} ==> " + "".join(["{}: {:.3f} ".format(k, v) for k, v in metrics.items()]))
@@ -894,143 +840,14 @@ class Evaluator3DWithBox(Evaluator3D):
         self.logger.info(
             f"Total infer {self.timer.calls} cases"
             + " - Elapse {:.1f}s".format(self.timer.total_time)
-            + " - {:.1f} s/it".format(self.timer.average_time)
+            + " - {:.1f} s/it".format(self.timer.spc)
         )
         for cls, metrics in self.eval_metrics.result().items():
             tp, fp, fn = metrics.pop("tp"), metrics.pop("fp"), metrics.pop("fn")
             lst = ["{}: {:.3f} ".format(k, v) for k, v in metrics.items()]
             lst.append("G_Dice: {:.3f}".format(2 * tp / (2 * tp + fn + fp)))
-            if self.cfg.data.guide_type != "none":
-                lst.append("(Avg inters: {:.1f}/{:.1f})".format(
-                    total_inters[0] / self.timer.calls, total_inters[1] / self.timer.calls))
+            lst.append("(Avg inters: {:.1f}/{:.1f})".format(
+                total_inters[0] / self.timer.calls, total_inters[1] / self.timer.calls))
             self.logger.info(f"    {cls} ==> " + "".join(lst))
 
         return
-
-
-class EvaluatorHybrid(Evaluator3D):
-    def __init__(self, config, model_hybrid, model2d):
-        """ Training class for hybrid 3D and 2D models
-
-        Parameters
-        ----------
-        config: ReadOnlyDict, all the configuraitons
-        model_hybrid: tf.keras.Model
-        model2d: tf.keras.Model
-        """
-        self.model2d = model2d
-        super(EvaluatorHybrid, self).__init__(config, model_hybrid)
-        self.tta_dict = {
-            1: [3], 2: [2], 3: [2, 3], 4: [1],
-            5: [1, 3], 6: [1, 2], 7: [1, 2, 3]
-        }
-
-    def infer_2d(self, x):
-        return self.model2d(x, training=False)
-
-    def load_weights(self, input_shape):
-        input_shape_2d, input_shape_3d = input_shape
-
-        self.model2d.build(input_shape_2d)
-        save_path_2d = find_checkpoint(checkpoint_dir=self.cfg.h.ckpt_dir_2d, checkpoint=self.cfg.h.ckpt_2d)
-        ckpt_2d = tf.train.Checkpoint(model=self.model2d)
-        ckpt_2d.restore(save_path_2d).expect_partial()
-        self.logger.info(f"Restore checkpoint from {save_path_2d} to {self.model2d.__class__.__name__}")
-
-        self.model.build(input_shape_3d)
-        save_path_3d = find_checkpoint(checkpoint_dir=self.cfg.g.model_dir + "/" + self.cfg.test.ckpt_dir,
-                                       checkpoint=self.cfg.test.ckpt)
-        ckpt_3d = tf.train.Checkpoint(model=self.model)
-        ckpt_3d.restore(save_path_3d).expect_partial()
-        self.logger.info(f"Restore checkpoint from {save_path_3d} to {self.model.__class__.__name__}")
-
-    @staticmethod
-    def volume_to_data_for_2d(volume):
-        depth, _, _ = volume.shape
-        padded_volume = np.pad(volume, ((1, 1), (0, 0), (0, 0)))[None, ..., None]
-        padded_volume = tf.convert_to_tensor(padded_volume, tf.float32)
-        guide_2d = np.zeros((1,) + volume.shape + (2,), np.float32)
-        marker = np.zeros((1, depth), np.bool)
-        return padded_volume, guide_2d, marker
-
-    @staticmethod
-    def update_guide_simul_2d(fg, new_pos, scale, guide_2d, marker, cfg):
-        z, centers = int(new_pos[0]), np.array([new_pos[1:]], np.float32) * scale
-        shape = guide_2d.shape[2:4]
-        if cfg.guide_type == "exp":
-            cur_guide = image_np_ops.gen_guide_nd(shape, centers, cfg.exp_stddev[1:])
-            update_op = np.maximum
-        elif cfg.guide_type == "euc":
-            cur_guide = image_np_ops.gen_guide_nd(shape, centers, euclidean=True)
-            update_op = np.minimum
-        else:
-            raise ValueError(f"Unsupported guide type: {cfg.guide_type}. [none/exp/euc]")
-        patch = guide_2d[0, z, :, :, fg]
-        guide_2d[0, z, :, :, fg] = update_op(patch, cur_guide) if patch.max() > 0 else cur_guide
-        marker[0, z] = True
-        return guide_2d, marker
-
-    def eval_inter_simul(self, volume, label, sample):
-        """ Evaluate with interactions by simulation.
-
-        Parameters
-        ----------
-        volume: np.ndarray, with shape [test_depth, test_height, test_width]
-        label: np.ndarray, with shape [ori_depth, ori_height, ori_width]
-        sample: pd.Series, use `sample.pid` to get patient id
-
-        Returns
-        -------
-        final_pred: np.ndarray, final prediction of this case
-        """
-        zoom_scale = np.array([1,
-                               volume.shape[1] / label.shape[1],
-                               volume.shape[2] / label.shape[2],
-                               1], np.float32)
-        label_bool = np.asarray(label, np.bool)
-        if label.shape[0] < volume.shape[0]:
-            label_bool = np.pad(label, ((0, volume.shape[0] - label.shape[0]), (0, 0), (0, 0)),
-                                mode="constant", constant_values=0)
-        padded_volume, guide_2d, marker = self.volume_to_data_for_2d(volume)
-        case_inters = [0, 0]
-        print("(Case {:3d}) Interacting: ".format(int(sample.pid)), end="", flush=True)
-        feature = [tf.convert_to_tensor(volume[None, ..., None], tf.float32), None]
-        guide, pred = None, None
-        num_iter, last_pos = [0, 0], None
-        pos_col = [[], []]      # Temporarily not used
-        data_save_counter = 0
-        while True:
-            guide, new_pos, fg, pos_col = update_guide_simul(
-                pred, label_bool, guide, self.cfg.data, num_iter, pos_col, ndim=3)
-            resized_guide = ndi.zoom(guide, zoom_scale, order=1)
-            feature[1] = tf.convert_to_tensor(resized_guide[None], tf.float32)
-
-            guide_2d, marker = self.update_guide_simul_2d(fg, new_pos, zoom_scale[1:3], guide_2d, marker, self.cfg.data)
-            data_for_2d = [tf.convert_to_tensor(x, tf.float32) for x in (padded_volume, guide_2d, marker)]
-            data_2d, marker_tensor = preprocess_2d_data(data_for_2d)
-            logits_2d = self.infer_2d(data_2d)
-            predictions_2d = tf.argmax(logits_2d, axis=-1)
-            pred_2d = postprocess_2d_data(predictions_2d, marker_tensor)
-
-            pred = self.eval_ops(feature + [pred_2d])     # [test_height, test_width]
-            pred = tf.argmax(pred, axis=-1).numpy().astype(np.uint8)[0]
-            # import pickle, zlib
-            # with open(f"data_{data_save_counter}.pkl.gz", "wb") as f:
-            #     s = pickle.dumps((feature[0].numpy(), feature[1].numpy(), pred_2d.numpy(),
-            #                       label, marker_tensor.numpy(), pred,
-            #                       data_2d[0].numpy(), data_2d[1].numpy()), pickle.HIGHEST_PROTOCOL)
-            #     f.write(zlib.compress(s))
-            #     data_save_counter += 1
-            pred = ndi.zoom(pred, 1. / zoom_scale[:-1], order=0)
-            dice = compute_dice(pred, label_bool)
-            print("{:.3f}->".format(dice), end="", flush=True)
-            # Reach the dice threshold or threshold of the number of the interactions
-            if dice > self.cfg.test.inter_thresh or \
-                    num_iter[0] + num_iter[1] >= self.cfg.test.max_iter:
-                print(" Number iters: {}/{}".format(num_iter[0], num_iter[1]))
-                case_inters[0] += num_iter[0]
-                case_inters[1] += num_iter[1]
-                break
-        if label.shape[0] != volume.shape[0]:
-            pred = pred[:label.shape[0] - volume.shape[0]]
-        return pred, case_inters

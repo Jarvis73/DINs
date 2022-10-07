@@ -128,3 +128,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 .idea/
+
+data/NF/nii_NF/*.nii.gz
+data/NF/test_NF/*.nii.gz
+data/NF/split_test.csv

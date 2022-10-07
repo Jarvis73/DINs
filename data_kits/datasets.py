@@ -13,19 +13,29 @@ from data_kits import np_ops, tf_ops
 _data_cache = None
 
 
-def loads(opt, logger, set_key):
-    data_list = nf_kits.load_split(set_key, opt.fold)
+def check_size(shape, *args):
+    if isinstance(shape, (list, tuple)):
+        res = [None if x <= 0 else x for x in shape]
+        if isinstance(shape, tuple):
+            res = tuple(res)
+        return res
+    elif isinstance(shape, (int, float)):
+        return tuple([None if shape <= 0 else shape] + [None if x <= 0 else x for x in args])
+    else:
+        raise TypeError(f"Unsupported type of shape: {type(shape)}")
 
-    if set_key in ["train", "val"]:
+
+def loads(opt, logger, set_key):
+    data_list = nf_kits.load_split(set_key, opt.fold, opt.fold_path)
+
+    if set_key in ["train", "eval_online"]:
         return get_loader_train(opt, logger, data_list, set_key)
     elif set_key == "eval":
         return get_loader_eval(opt, logger, data_list)
     elif set_key == "test":
         if opt.use_box:
             return get_loader_test_with_box(opt, logger, data_list)
-        return get_loader_test(opt, logger, data_list, set_key)
-    elif set_key == "extra":
-        return get_loader_test(opt, logger, data_list, set_key)
+        return get_loader_test(opt, logger, data_list)
     else:
         raise ValueError
 
@@ -124,7 +134,7 @@ def inter_simulation(mask, sampler, margin=3, step=10, n=11, bg=False, d=40, str
                 i = sampler.choice(ctr.shape[0])
             else:  # strategy == 2
                 dist = ctr.reshape(-1, 1, 3) - np.asarray(all_pts).reshape(1, -1, 3)
-                # choose the farest point
+                # choose the farthest point
                 i = np.argmax(np.sum(dist ** 2, axis=-1).min(axis=1))
             ctr = ctr[i]   # center z, y, x
         else:
@@ -167,7 +177,7 @@ def get_pts(lab_patch, num_inters_max, sampler):
     return fg_pts, bg_pts
 
 
-def data_processing(img, lab, *pts, opt, logger, mode):
+def data_processing(img, lab, *pts, opt=None, logger=None, mode=None):
     """
     Pre-process training data with tensorflow API
 
@@ -194,7 +204,7 @@ def data_processing(img, lab, *pts, opt, logger, mode):
     # z_score
     img = tf_ops.z_score(img)
 
-    target_shape = [opt.depth, opt.height, opt.width]
+    target_shape = tf.convert_to_tensor([opt.depth, opt.height, opt.width], dtype=tf.int32)
     # Only resize height and width. Keep depth unchanged.
     img = tf.image.resize(img, (opt.height, opt.width))
 
@@ -207,6 +217,7 @@ def data_processing(img, lab, *pts, opt, logger, mode):
                 gd = tf_ops.gen_guide_3d(target_shape, ctr, euclidean=True)
             elif opt.guide == "geo":
                 int_ctr = tf.cast(ctr, tf.int32)
+                # Convert numpy operations to tensorflow operations, sacrifice some performance
                 gd = tf.py_function(
                     np_ops.gen_guide_geo_3d, [img[..., 0], int_ctr, opt.geo_lamb, opt.geo_iter],
                     tf.float32, name="GeoDistLarge")
@@ -219,16 +230,15 @@ def data_processing(img, lab, *pts, opt, logger, mode):
             guide = tf.zeros(tf.concat([tf.shape(img)[:-1], [1]], axis=0), tf.float32)
         return guide
 
-    if opt.guide != "none":
-        fg_pts, bg_pts = pts
-        scale = tf.constant(target_shape, tf.float32) / tf.cast(tf.shape(lab), tf.float32)
-        fg_pts = fg_pts * scale
-        bg_pts = bg_pts * scale
-        fg_guide = pts_to_guide(fg_pts, opt.exp_stddev)
-        bg_guide = pts_to_guide(bg_pts, opt.exp_stddev)
-        logger.info(f"Use guide with {opt.guide} distance" +
-                    f", stddev={tuple(opt.exp_stddev)}" * (opt.guide == "exp"))
-        img = tf.concat([img, fg_guide, bg_guide], axis=-1)
+    fg_pts, bg_pts = pts
+    scale = tf.cast(target_shape, tf.float32) / tf.cast(tf.shape(lab), tf.float32)
+    fg_pts = fg_pts * scale
+    bg_pts = bg_pts * scale
+    fg_guide = pts_to_guide(fg_pts, opt.exp_stddev)
+    bg_guide = pts_to_guide(bg_pts, opt.exp_stddev)
+    logger.info(f"Use guide with {opt.guide} distance" +
+                f", stddev={tuple(opt.exp_stddev)}" * (opt.guide == "exp"))
+    img = tf.concat([img, fg_guide, bg_guide], axis=-1)
 
     if mode == "train":
         if opt.flip > 0:
@@ -239,9 +249,7 @@ def data_processing(img, lab, *pts, opt, logger, mode):
             img, lab = tf_ops.random_rotate(img, lab, rotate_scale=opt.rotate)
             lab = tf.squeeze(lab, axis=-1)
 
-    sp_guide = None
-    if opt.guide != "none":
-        img, sp_guide = tf.split(img, [opt.channel, 2], axis=-1)
+    img, sp_guide = tf.split(img, [opt.channel, 2], axis=-1)
 
     lab = tf.expand_dims(lab, axis=-1)
     lab = tf.image.resize(lab, (opt.height, opt.width), tf.image.ResizeMethod.NEAREST_NEIGHBOR)
@@ -250,8 +258,7 @@ def data_processing(img, lab, *pts, opt, logger, mode):
     if mode == "train":
         img = tf_ops.augment_gamma(img, gamma_range=(0.7, 1.5), retain_stats=True, p_per_sample=0.3)
 
-    if opt.guide != "none":
-        img = (img, sp_guide)
+    img = (img, sp_guide)
     return img, lab
 
 
@@ -298,9 +305,9 @@ def gen_batch(opt, data_list, mode, sampler):
         lab_patch: np.ndarray
             with shape [None, None, None], tf.int32
         fg_pts: np.ndarray
-            [guide != "none"] with shape [None, 3], np.float32
+            with shape [None, 3], np.float32
         bg_pts: np.ndarray
-            [guide != "none"] with shape [None, 3], np.float32
+            with shape [None, 3], np.float32
     """
     train = mode == "train"
     data = load_data()
@@ -308,6 +315,8 @@ def gen_batch(opt, data_list, mode, sampler):
     # dataset containing nf (remove benign scans)
     data_list['nf'] = [True if len(data[pid]['lab_rng']) > 1 else False for pid in data_list.pid]
     nf_set = data_list[data_list.nf]
+
+    # Set minimum sample percentage containing tumors
     force_tumor = math.ceil(opt.bs * opt.tumor_percent)
 
     target_size = np.array([opt.depth, opt.height, opt.width], dtype=np.float32)
@@ -318,10 +327,10 @@ def gen_batch(opt, data_list, mode, sampler):
 
     while True:
         nf = nf_set.sample(
-            n=force_tumor, replace=False, weights=None, random_state=sampler.get_state())
+            n=force_tumor, replace=False, weights=None, random_state=sampler)
         nf['flag'] = [1] * len(nf.index)
         rem = data_list[~data_list.index.isin(nf.index)].sample(
-            n=opt.bs - force_tumor, replace=False, weights=None, random_state=sampler.get_state())
+            n=opt.bs - force_tumor, replace=False, weights=None, random_state=sampler)
         rem['flag'] = [0] * len(rem.index)
         batch = pd.concat([nf, rem])
 
@@ -342,9 +351,7 @@ def gen_batch(opt, data_list, mode, sampler):
 
             img_patch = img_patch[..., None]
             yield_list = (img_patch.astype(np.float32), lab_patch.astype(np.int32))
-
-            if opt.guide != "none":
-                yield_list = yield_list + get_pts(lab_patch, opt.num_inters_max, sampler)
+            yield_list = yield_list + get_pts(lab_patch, opt.num_inters_max, sampler)
 
             yield yield_list
 
@@ -356,7 +363,7 @@ def get_loader_train(opt, logger, data_list, set_key):
     def train_gen():
         infinity_generator = gen_batch(opt, data_list, "train", np.random.RandomState())
         ranges = tqdm.tqdm(
-            range(opt.train_n * bs), leave=False, desc="Train", unit_scale=1. / bs,
+            range(opt.train_n), desc="Train", unit_scale=1. / bs,
             dynamic_ncols=True)
         for _ in ranges:
             yield next(infinity_generator)
@@ -364,30 +371,35 @@ def get_loader_train(opt, logger, data_list, set_key):
     def val_gen():
         infinity_generator = gen_batch(opt, data_list, "val", sampler=np.random.RandomState(1234))
         ranges = tqdm.tqdm(
-            range(opt.val_n * bs), leave=False, desc="Val", unit_scale=1. / bs,
+            range(opt.val_n), desc="Val", unit_scale=1. / bs,
             dynamic_ncols=True)
         for _ in ranges:
             yield next(infinity_generator)
 
     data_gen = train_gen if set_key == "train" else val_gen
 
-    input_shape = (bs, opt.depth, opt.height, opt.width, opt.channel)
-    output_signature = (
-        tf.TensorSpec((None, None, None, opt.channel), tf.float32),
-        tf.TensorSpec((None, None, None), tf.int32)
+    input_shape = [
+        check_size(bs, opt.depth, opt.height, opt.width, opt.channel),
+        check_size(bs, opt.depth, opt.height, opt.width, 2),
+    ]
+    output_types = (
+        tf.float32,
+        tf.int32,
+        tf.float32,
+        tf.float32
     )
-    if opt.guide != "none":
-        input_shape = [input_shape, (bs, opt.depth, opt.height, opt.width, 2)]
-        output_signature = output_signature + (
-            tf.TensorSpec((None, 3), tf.float32),
-            tf.TensorSpec((None, 3), tf.float32)
-        )
+    output_shapes = (
+        tf.TensorShape([None, None, None, opt.channel]),
+        tf.TensorShape([None, None, None]),
+        tf.TensorShape([None, 3]),
+        tf.TensorShape([None, 3]),
+    )
 
     def map_fn(*args):
-        func = data_processing(*args, opt, logger, mode=set_key)
+        func = data_processing(*args, opt=opt, logger=logger, mode=set_key)
         return func
 
-    dataset = tf.data.Dataset.from_generator(data_gen, output_signature=output_signature)\
+    dataset = tf.data.Dataset.from_generator(data_gen, output_types, output_shapes)\
         .map(map_fn, num_parallel_calls=bs * 2)\
         .batch(bs, drop_remainder=True)\
         .prefetch(2)
@@ -397,7 +409,9 @@ def get_loader_train(opt, logger, data_list, set_key):
 
 
 def eval_gen(opt, data_fn, data_list):
-    for _, sample in data_list.iterrows():
+    for i, (_, sample) in enumerate(data_list.iterrows(), start=1):
+        if 0 <= opt.test_n < i:
+            break
         volume, label, meta = data_fn(sample.pid)
         if label.max() == 0:
             continue
@@ -415,7 +429,7 @@ def eval_gen(opt, data_fn, data_list):
 def get_loader_eval(opt, logger, data_list):
     data = load_data(logger)
     data_list = data_list[[True if item.pid in data and item.remove != 1 else False
-                         for _, item in data_list.iterrows()]].copy()
+                          for _, item in data_list.iterrows()]].copy()
     data_list['nf'] = [True if len(data[pid]['lab_rng']) > 1 else False for pid in data_list.pid]
     data_list = data_list[data_list.nf]
     data = nf_kits.slim_labels(data, logger)
@@ -424,22 +438,16 @@ def get_loader_eval(opt, logger, data_list):
         return data[pid]["img"].astype(np.float32), data[pid]["slim"], data[pid]["meta"]
 
     generator = eval_gen(opt, data_fn, data_list)
-    input_shape = (1, opt.test_depth, opt.test_height, opt.test_width, opt.channel)
-    if opt.guide != "none":
-        input_shape = [input_shape, (1, opt.test_depth, opt.test_height, opt.test_width, 2)]
+    input_shape = [
+        check_size(1, opt.test_depth, opt.test_height, opt.test_width, opt.channel),
+        check_size(1, opt.test_depth, opt.test_height, opt.test_width, 2),
+    ]
 
     return generator, input_shape
 
 
-def get_loader_test(opt, logger, data_list, set_key,
-                    test_depth, test_height, test_width, channel, guide_type, std_split,
-                    reduce_shift):
-    if set_key == "test":
-        data = nf_kits.load_test_data_paths()   # Only contain data paths
-    elif set_key == "extra":
-        data = nf_kits.load_extra_data_paths()
-    else:
-        raise ValueError
+def get_loader_test(opt, logger, data_list):
+    data = nf_kits.load_test_data_paths()    # Only contain data paths
 
     data_list = data_list[[True if item.pid in data and item.remove != 1 else False
                            for _, item in data_list.iterrows()]].copy()
@@ -452,10 +460,11 @@ def get_loader_test(opt, logger, data_list, set_key,
             volume[volume < 0] = 0
         return volume, label, meta
 
-    generator = eval_gen(data_fn, data_list)
-    input_shape = (1, opt.test_depth, opt.test_height, opt.test_width, opt.channel)
-    if opt.guide != "none":
-        input_shape = [input_shape, (1, opt.test_depth, opt.test_height, opt.test_width, 2)]
+    generator = eval_gen(opt, data_fn, data_list)
+    input_shape = [
+        check_size(1, opt.test_depth, opt.test_height, opt.test_width, opt.channel),
+        check_size(1, opt.test_depth, opt.test_height, opt.test_width, 2),
+    ]
 
     return generator, input_shape
 
@@ -472,7 +481,7 @@ def eval_gen_with_box(opt, data_fn, data_list, box_ds):
         total = len(case_box_ds)
         for bid, (_, box) in enumerate(case_box_ds.iterrows()):
             if box['z1'] < 0:
-                # Use full image
+                # Use the full image
                 img_patch = volume
                 lab_patch = label
                 crop_box = None
@@ -518,8 +527,9 @@ def eval_gen_with_box(opt, data_fn, data_list, box_ds):
 
 
 def get_loader_test_with_box(opt, logger, data_list):
+    _ = logger
     data = nf_kits.load_test_data_paths()   # Only contain data paths
-    box_ds = nf_kits.load_box_csv()
+    box_ds = pd.read_csv(opt.bbox_path)
     box_pids = list(box_ds["pid"])
     data_list = data_list[[True if item.pid in data and item.pid in box_pids and item.remove != 1
                            else False for _, item in data_list.iterrows()]].copy()
@@ -530,26 +540,6 @@ def get_loader_test_with_box(opt, logger, data_list):
         label = np.clip(label, 0, 1)
         return volume, label, meta
 
-    generator = eval_gen_with_box(data_fn, data_list, box_ds)
+    generator = eval_gen_with_box(opt, data_fn, data_list, box_ds)
     input_shape = [(1, None, None, None, 1), (1, None, None, None, 2)]
     return generator, input_shape
-
-
-def load_case(cfg):
-    meta, volume = nf_kits.read_nii(cfg.case.img, np.float32)
-    _, label = nf_kits.read_nii(cfg.case.lab, np.int32)
-    if volume.shape[0] % 2 != 0:
-        volume = np.pad(volume, ((0, 1), (0, 0), (0, 0)))
-    if volume.shape[1] % 16 != 0 or volume.shape[2] % 16 != 0:
-        height = np.round(volume.shape[1] / 16) * 16
-        width = np.round(volume.shape[2] / 16) * 16
-        zoom_scale = [1, height / volume.shape[1], width / volume.shape[2]]
-        volume = ndi.zoom(volume, zoom_scale, order=1)
-    volume = np_ops.z_score(volume)
-
-    def generator():
-        sample = pd.Series([0, 0, 0, True], index="split pid remove nf".split())
-        yield sample, meta, volume, label
-
-    input_shape = [(1, *volume.shape, 1), (1, *volume.shape, 2)]
-    return generator(), input_shape
